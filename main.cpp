@@ -13,8 +13,11 @@
 
 #include "write_cfmap.h"
 #include "write_geodesics.h"
+#include "remove_degenerate_faces.h"
+#include "remove_isolated_components.h"
 
 #include <iostream>
+#include <algorithm>
 #include <map>
 #include <vector>
 #include <string>
@@ -84,6 +87,48 @@ int main(int argc, char* argv[]) {
     igl::slice(VO, vIdx, 1, V_coarse);
     // F is already re-indexed by remove_unreferenced_intrinsic
     MatrixXi F_coarse = F;
+
+    remove_degenerate_faces(F_coarse, F2V, IMV, BC);
+    remove_isolated_components(F_coarse, V_coarse, VO, F2V, IMV);
+
+    // Compact vertex array: remove vertices no longer referenced by any face
+    // (orphaned by degenerate-face removal or isolated-component removal above).
+    {
+        int nV = (int)V_coarse.rows();
+        std::vector<bool> ref(nV, false);
+        for (int f = 0; f < F_coarse.rows(); f++)
+            for (int k = 0; k < 3; k++) ref[F_coarse(f,k)] = true;
+        int nRef = (int)std::count(ref.begin(), ref.end(), true);
+        if (nRef < nV) {
+            std::vector<int> o2n(nV, -1), n2o;
+            n2o.reserve(nRef);
+            for (int i = 0; i < nV; i++) if (ref[i]) { o2n[i] = (int)n2o.size(); n2o.push_back(i); }
+            // Update F_coarse indices
+            for (int f = 0; f < F_coarse.rows(); f++)
+                for (int k = 0; k < 3; k++) F_coarse(f,k) = o2n[F_coarse(f,k)];
+            // Compact V_coarse
+            Eigen::MatrixXd Vc(nRef, 3);
+            for (int i = 0; i < nRef; i++) Vc.row(i) = V_coarse.row(n2o[i]);
+            V_coarse = Vc;
+            // Update IMV: remap or fall back to nearest if pointing to removed vertex
+            for (auto& kv : IMV) {
+                int cv = kv.second;
+                if (cv >= 0 && cv < nV && o2n[cv] >= 0) {
+                    kv.second = o2n[cv];
+                } else {
+                    // IMV pointed to an orphaned vertex — find nearest remaining
+                    int v = kv.first;
+                    int best = 0; double bestD = 1e30;
+                    for (int c = 0; c < nRef; c++) {
+                        double d = (VO.row(v) - V_coarse.row(c)).squaredNorm();
+                        if (d < bestD) { bestD = d; best = c; }
+                    }
+                    kv.second = best;
+                }
+            }
+            std::cerr << "Compacted: removed " << (nV - nRef) << " unreferenced vertex/vertices\n";
+        }
+    }
 
     std::cout << "Coarsened: " << V_coarse.rows() << " vertices, " << F_coarse.rows() << " faces" << std::endl;
 
